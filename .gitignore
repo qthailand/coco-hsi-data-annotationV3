@@ -1,0 +1,11 @@
+# ignore __pycache__ folders
+hsi_annotation/__pycache__/
+ui/__pycache__/
+test/__pycache__/
+
+#ignore datacube files
+*.bsq
+*.hdr
+
+
+
