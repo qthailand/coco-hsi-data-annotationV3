@@ -26,6 +26,7 @@ from PyQt5.QtWidgets import (
     QLabel,
     QMainWindow,
     QMessageBox,
+    QProgressDialog, 
     QSpinBox,
     QSplitter,
     QToolBar,
@@ -624,6 +625,7 @@ class PaintWindow(QMainWindow):
             ("circle",  "Circle", "C"),
             ("eraser",  "Eraser", "E"),
             ("move",    "Move",   "V"),
+            # ("wand",    "Wand",   "W"),
         ]:
             act = QAction(label, self)
             act.setCheckable(True)
@@ -631,6 +633,12 @@ class PaintWindow(QMainWindow):
             act.triggered.connect(lambda _, t=tool_key: self._set_tool(t))
             tb.addAction(act)
             self._tool_actions[tool_key] = act
+
+        auto_act = QAction("Auto", self)
+        auto_act.setShortcut("A")
+        auto_act.setToolTip("Auto-segment with K-Means [A]")
+        auto_act.triggered.connect(self._run_auto_segment)
+        tb.addAction(auto_act)
 
         self._tool_actions["connect"].setChecked(True)
         tb.addSeparator()
@@ -652,6 +660,15 @@ class PaintWindow(QMainWindow):
         opacity_spin.valueChanged.connect(
             lambda v: self._canvas.setOpacity(v / 100))
         tb.addWidget(opacity_spin)
+
+        # tb.addWidget(QLabel("  Tolerance: "))
+        # self._tolerance_spin = QSpinBox()
+        # self._tolerance_spin.setRange(1, 255)
+        # self._tolerance_spin.setValue(30)
+        # self._tolerance_spin.setFixedWidth(60)
+        # self._tolerance_spin.valueChanged.connect(
+        #     self._canvas.set_wand_tolerance)
+        # tb.addWidget(self._tolerance_spin)
         tb.addSeparator()
 
         tb.addWidget(QLabel("  Zoom: "))
@@ -1328,6 +1345,127 @@ class PaintWindow(QMainWindow):
     def _on_move_hit_annotation(self, ann_id):
         """Auto-select annotation hit by move tool."""
         self._annotation_panel.select_annotation(ann_id)
+    def _run_auto_segment(self):
+        """K-Means clustering on RGB → per-contour annotations."""
+        if not self._canvas.is_loaded:
+            QMessageBox.warning(self, "No data", "Load a datacube first.")
+            return
+
+        try:
+            import cv2
+        except ImportError:
+            QMessageBox.warning(
+                self, "Missing",
+                "OpenCV required: pip install opencv-python")
+            return
+
+        rgb = self._canvas._rgb_array
+        if rgb is None:
+            QMessageBox.warning(self, "No RGB", "No RGB preview.")
+            return
+
+        cat_ids = self._cat_registry.ids()
+        if not cat_ids:
+            QMessageBox.warning(
+                self, "No categories", "Create categories first.")
+            return
+
+        k = len(cat_ids)
+
+        # ── Progress dialog ──
+        progress = QProgressDialog(
+            "Auto-segmenting K={} ({} categories)...".format(k, k),
+            None,  # no cancel button
+            0, 0,  # indeterminate
+            self)
+        progress.setWindowTitle("Processing")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        progress.show()
+        QApplication.processEvents()
+
+        try:
+            h, w = rgb.shape[:2]
+            pixels = rgb.reshape(-1, 3).astype(np.float32)
+
+            # ── K-Means ──
+            progress.setLabelText(
+                "Running K-Means K={}...".format(k))
+            QApplication.processEvents()
+
+            criteria = (
+                cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER,
+                100, 0.2)
+            _, labels, _ = cv2.kmeans(
+                pixels, k, None, criteria, 10,
+                cv2.KMEANS_PP_CENTERS)
+            label_map = labels.reshape(h, w).astype(np.int32)
+
+            kernel = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE, (5, 5))
+            cat_list = list(cat_ids)
+            min_area = max(100, (h * w) // 10000)
+
+            total_anns = 0
+            for cluster_id in range(k):
+                cat_id = cat_list[cluster_id]
+                cat_color = self._cat_registry.color(cat_id)
+
+                progress.setLabelText(
+                    "Cluster {}/{}: {}...".format(
+                        cluster_id + 1, k,
+                        self._cat_registry.name(cat_id)))
+                QApplication.processEvents()
+
+                mask = (label_map == cluster_id).astype(np.uint8) * 255
+                mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+                mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+                contours, _ = cv2.findContours(
+                    mask, cv2.RETR_EXTERNAL,
+                    cv2.CHAIN_APPROX_SIMPLE)
+
+                for contour in contours:
+                    area = cv2.contourArea(contour)
+                    if area < min_area:
+                        continue
+                    c = contour.squeeze(axis=1)
+                    if len(c) < 3:
+                        continue
+                    flat = c.flatten().tolist()
+                    if len(flat) < 6:
+                        continue
+
+                    xs = [flat[i] for i in range(0, len(flat), 2)]
+                    ys = [flat[i] for i in range(1, len(flat), 2)]
+                    x0, y0 = min(xs), min(ys)
+                    x1, y1 = max(xs), max(ys)
+                    bbox = [x0, y0, x1 - x0, y1 - y0]
+
+                    ann_id = self._annot_registry.add(
+                        cat_id, bbox=bbox,
+                        segmentation=[flat], area=int(area))
+                    self._canvas.paint_annotation_layer(
+                        ann_id, [flat], cat_color)
+                    total_anns += 1
+
+            self._canvas._composite()
+
+            all_anns = self._annot_registry.all()
+            if all_anns:
+                self._annotation_panel.select_annotation(
+                    all_anns[0]["id"])
+            self._refresh_pg()
+            self._update_bbox_overlays()
+            self._compute_category_spectra()
+
+            self.statusBar().showMessage(
+                "Auto: {} categories → {} annotations".format(
+                    k, total_anns), 5000)
+
+        finally:
+            progress.close()
     # ------------------------------------------------------------------
     # Shape completed → MERGE into annotation
     # ------------------------------------------------------------------
@@ -1663,6 +1801,7 @@ class PaintWindow(QMainWindow):
             self._preview_low_cut, self._preview_high_cut)
         if rgb_img:
             self._cube_rgb_cache[self._current_hdr_path] = rgb_img
+            self._canvas.set_rgb_preview(rgb_img)  # ← เพิ่ม
 
     def _refresh_pg(self):
         pass  # PgPanel shows spectrum only, no image view

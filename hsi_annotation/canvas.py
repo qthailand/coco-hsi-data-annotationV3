@@ -100,6 +100,8 @@ class CanvasItem(QGraphicsPixmapItem):
         self._moving_start  = None
         self._total_move_dx = 0.0
         self._total_move_dy = 0.0
+        self._rgb_array = None       # (h, w, 3) uint8 for wand
+        self._wand_tolerance = 30
 
         # ── Layer system ──
         self._layers = {}         # {ann_id: QImage ARGB32}
@@ -379,7 +381,7 @@ class CanvasItem(QGraphicsPixmapItem):
             elif self._tool == "move":
                 hit_id = self._hit_test_layers(event.pos())
                 if hit_id is None:
-                    return  # ← miss → don't do anything
+                    return
                 self._moving_ann_id = hit_id
                 self._moving_start  = QPointF(event.pos())
                 self._total_move_dx = 0.0
@@ -387,6 +389,37 @@ class CanvasItem(QGraphicsPixmapItem):
                 self._drawing = True
                 if hit_id != self._current_annotation_id:
                     self.signals.move_hit_annotation.emit(hit_id)
+            elif self._tool == "wand":
+                polygons = self._wand_select(event.pos())
+                if polygons:
+                    color = QColor(self._pen_color)
+                    color.setAlpha(220)
+                    color_rgb = (color.red(), color.green(), color.blue())
+                    self.paint_annotation_layer(
+                        self._current_annotation_id,
+                        polygons, color_rgb)
+                    # Compute bbox from all polygons
+                    all_xs, all_ys = [], []
+                    for poly in polygons:
+                        pts = self._segmentation_to_points(poly)
+                        for p in pts:
+                            all_xs.append(p.x())
+                            all_ys.append(p.y())
+                    if all_xs:
+                        bbox = [min(all_xs), min(all_ys),
+                                max(all_xs) - min(all_xs),
+                                max(all_ys) - min(all_ys)]
+                        # Count pixels
+                        layer_np = self.layer_to_numpy(
+                            self._current_annotation_id)
+                        area = int(np.count_nonzero(
+                            layer_np[:, :, 3] > 0)) \
+                            if layer_np is not None else 0
+                        self.signals.shape_completed.emit(
+                            self._current_annotation_id,
+                            bbox, polygons, area)
+                    self.signals.shape_closed.emit()
+                    self.signals.updated.emit()
         elif event.button() == Qt.RightButton \
                 and self._tool == "connect":
             self._close_connect_path()
@@ -616,6 +649,124 @@ class CanvasItem(QGraphicsPixmapItem):
                     QPointF(p1.x() + dx * t, p1.y() + dy * t), r, r)
 
         painter.end()
+
+    # ------------------------------------------------------------------
+    # Magic Wand tool
+    # ------------------------------------------------------------------
+
+    def set_wand_tolerance(self, tolerance):
+        self._wand_tolerance = int(tolerance)
+
+    def set_rgb_preview(self, qimage):
+        """Store RGB preview as numpy for wand flood fill."""
+        if qimage is None:
+            self._rgb_array = None
+            return
+        rgba = qimage.convertToFormat(QImage.Format_RGBA8888)
+        w, h = rgba.width(), rgba.height()
+        ptr = rgba.bits()
+        ptr.setsize(h * w * 4)
+        arr = np.frombuffer(ptr, np.uint8).reshape((h, w, 4))
+        self._rgb_array = arr[:, :, :3].copy()
+
+    def _wand_select(self, pos):
+        """Flood fill on RGB preview at pos with tolerance.
+        Returns list of flat polygon lists or empty list."""
+        if self._rgb_array is None:
+            log.warning("[wand] No RGB preview available")
+            return []
+        if self._current_annotation_id is None:
+            log.warning("[wand] No active annotation")
+            return []
+
+        h, w = self._rgb_array.shape[:2]
+        x, y = int(pos.x()), int(pos.y())
+        if not (0 <= x < w and 0 <= y < h):
+            return []
+
+        try:
+            import cv2
+            return self._wand_cv2(x, y, w, h)
+        except ImportError:
+            return self._wand_numpy(x, y, w, h)
+
+    def _wand_cv2(self, x, y, w, h):
+        """Wand using cv2.floodFill (fast)."""
+        import cv2
+
+        tolerance = self._wand_tolerance
+        mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
+        rgb_copy = self._rgb_array.copy()
+
+        cv2.floodFill(
+            rgb_copy, mask, (x, y), 255,
+            loDiff=(tolerance, tolerance, tolerance),
+            upDiff=(tolerance, tolerance, tolerance),
+            flags=cv2.FLOODFILL_MASK_ONLY | (255 << 8),
+        )
+        selection = mask[1:-1, 1:-1] > 0
+
+        if not np.any(selection):
+            return []
+
+        # Contour detect
+        contours, _ = cv2.findContours(
+            selection.astype(np.uint8),
+            cv2.RETR_TREE,
+            cv2.CHAIN_APPROX_SIMPLE,
+        )
+        polygons = []
+        for contour in contours:
+            c = contour.squeeze(axis=1)
+            if len(c) < 3:
+                continue
+            flat = c.flatten().tolist()
+            if len(flat) >= 6:
+                polygons.append(flat)
+
+        return polygons
+
+    def _wand_numpy(self, x, y, w, h):
+        """Wand fallback using numpy BFS (slower)."""
+        tolerance = self._wand_tolerance
+        target = self._rgb_array[y, x].astype(np.float32)
+        rgb = self._rgb_array.astype(np.float32)
+
+        # Color distance
+        dist = np.sqrt(np.sum((rgb - target) ** 2, axis=2))
+        candidate = dist <= tolerance * np.sqrt(3)
+
+        # BFS from click point
+        visited = np.zeros((h, w), dtype=bool)
+        stack = [(y, x)]
+        visited[y, x] = True
+        pixels = []
+
+        while stack:
+            cy, cx = stack.pop()
+            if not candidate[cy, cx]:
+                continue
+            pixels.append((cx, cy))
+            for ny, nx in ((cy-1,cx),(cy+1,cx),(cy,cx-1),(cy,cx+1)):
+                if (0 <= ny < h and 0 <= nx < w
+                        and not visited[ny, nx]
+                        and candidate[ny, nx]):
+                    visited[ny, nx] = True
+                    stack.append((ny, nx))
+
+        if len(pixels) < 3:
+            return []
+
+        # Bbox polygon fallback
+        xs = [p[0] for p in pixels]
+        ys = [p[1] for p in pixels]
+        x0, x1 = min(xs), max(xs)
+        y0, y1 = min(ys), max(ys)
+        return [[
+            float(x0), float(y0), float(x1), float(y0),
+            float(x1), float(y1), float(x0), float(y1),
+        ]]
+
     def _erase_composite(self):
         """Fast composite: merge only active layer change into current mask.
         Avoids full _composite() during drag for performance."""
