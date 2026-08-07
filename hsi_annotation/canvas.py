@@ -53,6 +53,8 @@ class CanvasSignals(QObject):
     shape_completed = pyqtSignal(int, object, object, int)
     spectrum_ready = pyqtSignal(int, int, object)
     loaded = pyqtSignal(int, int, int)
+    move_completed = pyqtSignal(int, float, float)
+    move_hit_annotation = pyqtSignal(int)  # ann_id to select
 
 
 class BgItem(QGraphicsPixmapItem):
@@ -93,6 +95,11 @@ class CanvasItem(QGraphicsPixmapItem):
         self._circle_center = None
         self._circle_radius = 0
         self._circle_base_mask = None
+
+        self._moving_ann_id = None
+        self._moving_start  = None
+        self._total_move_dx = 0.0
+        self._total_move_dy = 0.0
 
         # ── Layer system ──
         self._layers = {}         # {ann_id: QImage ARGB32}
@@ -153,6 +160,36 @@ class CanvasItem(QGraphicsPixmapItem):
     def set_layer_visible(self, ann_id, visible):
         self._layer_visible[ann_id] = bool(visible)
         self._composite()
+
+    def move_layer(self, ann_id, dx, dy):
+        """Translate layer pixels by (dx, dy)."""
+        layer = self._layers.get(ann_id)
+        if layer is None:
+            return
+        w, h = self._layer_w, self._layer_h
+        new_layer = QImage(w, h, QImage.Format_ARGB32)
+        new_layer.fill(0)
+        painter = QPainter(new_layer)
+        painter.drawImage(int(dx), int(dy), layer)
+        painter.end()
+        self._layers[ann_id] = new_layer
+        self._composite()
+
+    def _hit_test_layers(self, pos):
+        """Find top-most annotation with non-transparent pixel at pos."""
+        x, y = int(pos.x()), int(pos.y())
+        if not (0 <= x < self._layer_w and 0 <= y < self._layer_h):
+            return None
+        # Check in reverse order (top layers first)
+        for ann_id in reversed(sorted(self._layers.keys())):
+            if not self._layer_visible.get(ann_id, True):
+                continue
+            layer = self._layers[ann_id]
+            pixel = layer.pixel(x, y)
+            alpha = (pixel >> 24) & 0xFF
+            if alpha > 0:
+                return ann_id
+        return None
 
     def layer_to_numpy(self, ann_id):
         """Read annotation layer as RGBA numpy array."""
@@ -318,7 +355,7 @@ class CanvasItem(QGraphicsPixmapItem):
             if self._tool == "probe":
                 self._emit_spectrum(event.pos(), force=True)
                 return
-            if self._tool != "eraser" and \
+            if self._tool not in ("eraser", "move") and \
                     not self.has_active_annotation:
                 log.warning("Drawing blocked: no active annotation")
                 return
@@ -339,12 +376,20 @@ class CanvasItem(QGraphicsPixmapItem):
                 self._composite()
                 self._update_eraser_cursor(event.pos())
                 self._emit_spectrum(event.pos(), force=True)
+            elif self._tool == "move":
+                hit_id = self._hit_test_layers(event.pos())
+                if hit_id is None:
+                    return  # ← miss → don't do anything
+                self._moving_ann_id = hit_id
+                self._moving_start  = QPointF(event.pos())
+                self._total_move_dx = 0.0
+                self._total_move_dy = 0.0
+                self._drawing = True
+                if hit_id != self._current_annotation_id:
+                    self.signals.move_hit_annotation.emit(hit_id)
         elif event.button() == Qt.RightButton \
                 and self._tool == "connect":
             self._close_connect_path()
-
-    def mouseDoubleClickEvent(self, event):
-        event.ignore()
 
     def mouseMoveEvent(self, event):
         if not self._is_loaded:
@@ -364,14 +409,17 @@ class CanvasItem(QGraphicsPixmapItem):
                 self._last_pos = event.pos()
                 self._composite()
                 self._update_eraser_cursor(event.pos())
-            else:
+            elif self._tool == "move" and self._moving_ann_id is not None:
+                dx = event.pos().x() - self._moving_start.x()
+                dy = event.pos().y() - self._moving_start.y()
+                self.move_layer(self._moving_ann_id, dx, dy)
+                self._moving_start = QPointF(event.pos())
+                self._total_move_dx += dx
+                self._total_move_dy += dy
+            elif self._tool not in ("eraser", "move"):
                 self._draw_line(self._last_pos, event.pos())
                 self._last_pos = event.pos()
             self._emit_spectrum(event.pos())
-
-    def hoverLeaveEvent(self, event):
-        if self._tool == "eraser":
-            self._clear_eraser_cursor()
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.LeftButton:
@@ -382,6 +430,16 @@ class CanvasItem(QGraphicsPixmapItem):
                 self.signals.updated.emit()
                 self.signals.shape_closed.emit()
                 self._emit_spectrum(event.pos(), force=True)
+            elif self._tool == "move" and self._moving_ann_id is not None:
+                ann_id = self._moving_ann_id
+                dx = self._total_move_dx
+                dy = self._total_move_dy
+                self._moving_ann_id = None
+                self._moving_start  = None
+                self._total_move_dx = 0.0
+                self._total_move_dy = 0.0
+                if abs(dx) >= 0.5 or abs(dy) >= 0.5:
+                    self.signals.move_completed.emit(ann_id, dx, dy)
             elif self._tool == "circle":
                 if self._drawing and self._circle_radius > 0:
                     self._paint_circle(self._circle_center,
@@ -402,6 +460,13 @@ class CanvasItem(QGraphicsPixmapItem):
                 self.signals.shape_closed.emit()
                 self._emit_spectrum(event.pos(), force=True)
 
+    def mouseDoubleClickEvent(self, event):
+        event.ignore()
+
+    def hoverLeaveEvent(self, event):
+        if self._tool == "eraser":
+            self._clear_eraser_cursor()
+
     # ------------------------------------------------------------------
     # Drawing on active layer
     # ------------------------------------------------------------------
@@ -414,8 +479,11 @@ class CanvasItem(QGraphicsPixmapItem):
         layer = self._get_or_create_layer(ann_id)
         painter = QPainter(layer)
         if self._tool == "eraser":
-            painter.setCompositionMode(
-                QPainter.CompositionMode_Clear)
+            painter.setCompositionMode(QPainter.CompositionMode_Clear)
+        else:
+            pen = QPen(self._pen_color, self._pen_width,
+                       Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+            painter.setPen(pen)
         painter_fn(painter)
         painter.end()
         self._composite()
@@ -464,11 +532,16 @@ class CanvasItem(QGraphicsPixmapItem):
         ann_id = self._current_annotation_id
         if ann_id is None:
             return
+
         layer = self._get_or_create_layer(ann_id)
+
+        # Fill polygon on top of existing content (merge, not replace)
         painter = QPainter(layer)
         color = QColor(self._pen_color)
         color.setAlpha(220)
-        painter.setPen(Qt.NoPen)
+        pen = QPen(color, self._pen_width,
+                   Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+        painter.setPen(pen)
         painter.setBrush(QBrush(color))
         painter.drawPolygon(QPolygonF(self._connect_points))
         painter.end()

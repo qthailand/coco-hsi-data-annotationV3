@@ -75,6 +75,12 @@ class PaintWindow(QMainWindow):
         self._current_hdr_path = None
         self._cube_ann_cache = {}  # {hdr_path: {"annotations": [...], "next_id": int}}
         self._cube_rgb_cache = {}  # {hdr_path: QImage}
+
+        self._moving_ann_id = None
+        self._moving_start  = None
+        self._total_move_dx = 0.0
+        self._total_move_dy = 0.0
+
         # --- Registries ---
         self._cat_registry   = CategoryRegistry(self)
         self._annot_registry = AnnotationRegistry(self)
@@ -151,6 +157,10 @@ class PaintWindow(QMainWindow):
         self._canvas.signals.spectrum_ready.connect(
             self._pg_panel.update_spectrum)
         self._canvas.signals.loaded.connect(self._on_loaded)
+        self._canvas.signals.move_completed.connect(
+            self._on_move_completed)
+        self._canvas.signals.move_hit_annotation.connect(
+            self._on_move_hit_annotation)
 
         # --- Category registry → canvas sync ---
         self._cat_registry.category_changed.connect(
@@ -610,9 +620,10 @@ class PaintWindow(QMainWindow):
 
         # Drawing tools
         for tool_key, label, shortcut in [
-            ("connect", "Draw", "L"),
-            ("circle",  "Circle",  "C"),
-            ("eraser",  "Eraser",  "E"),
+            ("connect", "Draw",   "L"),
+            ("circle",  "Circle", "C"),
+            ("eraser",  "Eraser", "E"),
+            ("move",    "Move",   "V"),
         ]:
             act = QAction(label, self)
             act.setCheckable(True)
@@ -1271,6 +1282,52 @@ class PaintWindow(QMainWindow):
         from ..canvas import CanvasItem
         self._canvas._eraser_clip_polygons = \
             CanvasItem._normalize_segmentation(seg)
+        
+    def _on_move_completed(self, ann_id, dx, dy):
+        """Finalize move: translate segmentation + bbox in registry."""
+        ann = self._annot_registry.get(ann_id)
+        if ann is None:
+            return
+
+        # Translate segmentation
+        old_seg = ann.get("segmentation", [])
+        new_seg = []
+        if old_seg:
+            polygons = old_seg if isinstance(old_seg[0], list) \
+                else [old_seg]
+            for poly in polygons:
+                it = iter(poly)
+                new_poly = []
+                for x, y in zip(it, it):
+                    new_poly.extend([float(x) + dx, float(y) + dy])
+                new_seg.append(new_poly)
+
+        # Translate bbox
+        old_bbox = ann.get("bbox", [])
+        if len(old_bbox) >= 4:
+            new_bbox = [
+                float(old_bbox[0]) + dx,
+                float(old_bbox[1]) + dy,
+                float(old_bbox[2]),
+                float(old_bbox[3]),
+            ]
+        else:
+            new_bbox = old_bbox
+
+        self._annot_registry.update(
+            ann_id, bbox=new_bbox, segmentation=new_seg)
+
+        self._update_bbox_overlays()
+        self._compute_category_spectra()
+
+        log.info("Moved #%d by (%.1f, %.1f)", ann_id, dx, dy)
+        self.statusBar().showMessage(
+            "Moved #{} by ({:.0f}, {:.0f})".format(
+                ann_id, dx, dy), 3000)
+        
+    def _on_move_hit_annotation(self, ann_id):
+        """Auto-select annotation hit by move tool."""
+        self._annotation_panel.select_annotation(ann_id)
     # ------------------------------------------------------------------
     # Shape completed → MERGE into annotation
     # ------------------------------------------------------------------
@@ -1541,7 +1598,28 @@ class PaintWindow(QMainWindow):
                     active_id, category_id, name, qc)
 
         self._update_bbox_overlays()
+        self._update_plot_title()
 
+    def _update_plot_title(self):
+        """Update PgPanel plot title with current category names/colors."""
+        if not self._canvas.is_loaded:
+            return
+        parts = []
+        for cid in self._cat_registry.ids():
+            if not self._cat_registry.is_visible(cid):
+                continue
+            name = self._cat_registry.name(cid)
+            color = self._cat_registry.qcolor(cid)
+            has_ann = any(
+                a["category_id"] == cid
+                for a in self._annot_registry.all())
+            if not has_ann:
+                continue
+            parts.append(
+                "<span style='color:#{:02x}{:02x}{:02x}'>{}</span>"
+                .format(color.red(), color.green(), color.blue(), name))
+        self._pg_panel._spec_plot.setTitle("  ".join(parts) if parts else "")
+        
     def _on_category_about_to_be_removed(self, category_id, old_color):
         if self._canvas is None or not self._canvas.is_loaded:
             return
